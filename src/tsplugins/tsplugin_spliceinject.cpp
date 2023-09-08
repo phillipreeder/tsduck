@@ -136,6 +136,7 @@ namespace ts {
 
             SpliceInformationTable sit;       // The analyzed Splice Information Table.
             SectionPtr             section;   // The binary SIT section.
+            uint64_t               force_pts;  // Next PTS after which the section shall be inserted (INVALID_PTS means immediate).
             uint64_t               next_pts;  // Next PTS after which the section shall be inserted (INVALID_PTS means immediate).
             uint64_t               last_pts;  // PTS after which the section shall no longer be inserted (INVALID_PTS means never).
             uint64_t               interval;  // Interval between two insertions in PTS units.
@@ -697,10 +698,25 @@ void ts::SpliceInjectPlugin::provideSection(SectionCounter counter, SectionPtr& 
             break;
         }
         assert(cmd->sit.isValid());
+        
+        if (cmd->force_pts != INVALID_PTS) {
+            // once we're after the force_pts time
+            if (SequencedPTS(cmd->force_pts, _last_pts)) {
+                CommandPtr cmd2;
+                const bool dequeued = _queue.dequeue(cmd2, 0);
+                assert(dequeued);
+                assert(cmd2 == cmd);
+
+                // Now we have a section to send.
+                section = cmd->section;
+                tsp->verbose(u"injecting %s, current PTS: %d", {*cmd, _last_pts});
+            }
+            break;
+        }
 
         // If the command has a termination PTS and this PTS is in the past,
         // drop the command and loop on next command from the queue.
-        if (cmd->last_pts != INVALID_PTS && SequencedPTS(cmd->last_pts, _last_pts)) {
+        else if (cmd->last_pts != INVALID_PTS && SequencedPTS(cmd->last_pts, _last_pts)) {
             CommandPtr cmd2;
             const bool dequeued = _queue.dequeue(cmd2, 0);
             assert(dequeued);
@@ -787,7 +803,7 @@ void ts::SpliceInjectPlugin::parseSection(std::istringstream& strm, FType type, 
                            {names::TID(duck, sec->tableId(), CASID_NULL, NamesFlags::VALUE)});
             } else {
                 CommandPtr cmd(new SpliceCommand(this, sec, pts));
-                if (cmd.isNull() || !cmd->sit.isValid() || cmd->last_pts == INVALID_PTS) {
+                if (cmd.isNull() || !cmd->sit.isValid()) {
                     tsp->error(u"received invalid splice information "
                                u"section, ignored");
                 } else {
@@ -915,6 +931,7 @@ void ts::SpliceInjectPlugin::processSectionMessage(const uint8_t* addr, size_t s
 ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin *plugin, const SectionPtr &sec, const uint64_t known_pts) :
     sit(),
     section(sec),
+    force_pts(known_pts),
     next_pts(INVALID_PTS),   // inject immediately
     last_pts(INVALID_PTS),   // no injection time limit
     interval((plugin->_inject_interval * SYSTEM_CLOCK_SUBFREQ) / MilliSecPerSec), // in PTS units
@@ -938,15 +955,13 @@ ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin *plugin,
     // time_signal() commands.
     if (sit.isValid() &&
         ((sit.splice_command_type == SPLICE_TIME_SIGNAL && sit.time_signal.set()) ||
-        (sit.splice_command_type == SPLICE_INSERT && !sit.splice_insert.canceled))) {
+        (sit.splice_command_type == SPLICE_INSERT && !sit.splice_insert.canceled && !sit.splice_insert.immediate))) {
         // Compute the splice event PTS value. This will be the last time for
         // the splice command injection since the event is obsolete afterward.
         if (sit.splice_command_type == SPLICE_INSERT) {
             if (sit.splice_insert.program_splice) {
                 // Common PTS value, program-wide.
-                if (sit.splice_insert.immediate) {
-                    last_pts = known_pts;
-                } else if (sit.splice_insert.program_pts.set()) {
+                if (sit.splice_insert.program_pts.set()) {
                     last_pts = sit.splice_insert.program_pts.value();
                 }
             }
@@ -968,9 +983,7 @@ ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin *plugin,
         // Otherwise, compute initial PTS and injection count.
         if (last_pts != INVALID_PTS) {
             last_pts = (last_pts + sit.pts_adjustment) & PTS_DTS_MASK;
-            if (sit.splice_command_type != SPLICE_INSERT || !sit.splice_insert.immediate) {
-                count = _plugin->_inject_count;
-            }
+            count = _plugin->_inject_count;
             // Preceding delay for injection in PTS units.
             const uint64_t preceding = (_plugin->_start_delay * SYSTEM_CLOCK_SUBFREQ) / MilliSecPerSec;
             // Compute the first PTS time for injection.
@@ -989,19 +1002,28 @@ ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin *plugin,
 
 bool ts::SpliceInjectPlugin::SpliceCommand::operator<(const SpliceCommand& other) const
 {
-    if (next_pts == other.next_pts) {
+    uint64_t my_next_pts = next_pts;
+    uint64_t other_next_pts = other.next_pts;
+    if (force_pts != INVALID_PTS) {
+        my_next_pts = force_pts;
+    }
+    if (other.force_pts != INVALID_PTS) {
+        other_next_pts = other.force_pts;
+    }
+    
+    if (my_next_pts == other_next_pts) {
         // Either both elements are immediate or non-immediate with same starting point.
         // We always consider this object greater than other so that messages with equal
         // starting points are queued in order of appearance.
         return false;
     }
-    else if (next_pts == INVALID_PTS) {
+    else if (my_next_pts == INVALID_PTS) {
         // This object is immediate, other is not.
         return true;
     }
     else {
         // This object is not immediate.
-        return other.next_pts != INVALID_PTS && next_pts < other.next_pts;
+        return other_next_pts != INVALID_PTS && my_next_pts < other_next_pts;
     }
 }
 
@@ -1031,7 +1053,10 @@ ts::UString ts::SpliceInjectPlugin::SpliceCommand::toString() const
         {
             name.append(UString::Format(u" @0x%09X", {sit.splice_insert.program_pts.value()}));
         }
-        if (next_pts == INVALID_PTS) {
+        if (force_pts != INVALID_PTS) {
+            name.append(UString::Format(u", force %d", {force_pts}));
+        }
+        else if (next_pts == INVALID_PTS) {
             name.append(u", immediate");
         }
         else {

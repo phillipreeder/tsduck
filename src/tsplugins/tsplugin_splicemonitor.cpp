@@ -499,6 +499,13 @@ void ts::SpliceMonitorPlugin::processEvent(PID splice_pid, uint32_t event_id, ui
     auto evt = ctx.splice_events.find(event_id);
     bool known_event = evt != ctx.splice_events.end();
 
+    if (_injector_log) {
+        UString file_name = UString();
+        file_name.format(u"%s_%d.bin", {_output_file, _last_pts});
+        duck.setOutput(file_name);
+    }
+
+
     // Time to event in ms. Negative if event is in the past.
     Variable<MilliSecond> time_to_event;
     if (ctx.last_pts != INVALID_PTS) {
@@ -630,12 +637,6 @@ void ts::SpliceMonitorPlugin::handleTable(SectionDemux& demux, const BinaryTable
             _json_args.report(_x2j_conv.convertToJSON(doc, true)->query(u"#nodes[0]"), _json_doc, *tsp);
         }
         else {
-            if (_injector_log) {
-                UString file_name = UString();
-                file_name.format(u"%s_%d.bin", {_output_file, event_id});
-                duck.setOutput(file_name);
-            }
-
             // Human-readable display of the SCTE-35 table.
             if (_displayed_table && !_injector_log) {
                 _display << std::endl;
