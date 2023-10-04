@@ -115,6 +115,7 @@ namespace ts {
         xml::JSONConverter          _x2j_conv;         // XML-to-JSON converter.
         json::RunningDocument       _json_doc;         // JSON document, built on-the-fly.
         uint64_t                    _last_pts;         // The last known PTS of all packet
+        uint64_t                    _splice_index;      // Incrementing counter of splices
 
         // Associate all audio/video PID's in a PMT to a splice PID.
         void setSplicePID(const PMT&, PID);
@@ -164,7 +165,8 @@ ts::SpliceMonitorPlugin::SpliceMonitorPlugin(TSP* tsp_) :
     _sig_demux(duck, this),
     _x2j_conv(*tsp),
     _json_doc(*tsp),
-    _last_pts(0)
+    _last_pts(0),
+    _splice_index(0)
 {
     _json_args.defineArgs(*this, true, u"Build a JSON report into the specified file. Using '-' means standard output.");
 
@@ -501,7 +503,8 @@ void ts::SpliceMonitorPlugin::processEvent(PID splice_pid, uint32_t event_id, ui
 
     if (_injector_log) {
         UString file_name = UString();
-        file_name.format(u"%s_%d.bin", {_output_file, _last_pts});
+        file_name.format(u"%s_%d.bin", {_output_file, _splice_index});
+        _splice_index += 1;
         duck.setOutput(file_name);
     }
 
