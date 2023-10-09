@@ -845,26 +845,43 @@ void ts::SpliceInjectPlugin::processSectionMessage(const uint8_t* addr, size_t s
             // Start of splicemonitor
             type = FType::BINARY;
 
+            // Boundary check
+            if (size < 2) {
+                return; // Buffer is too small to even skip initial "* "
+            }
             addr += 2; // Skip initial "* "
             size -= 2;
 
-            const uint8_t *end_line = addr + 1;
-            while (*end_line != '\n') {
+            const uint8_t *end_line = addr;
+            while (size > 0 && *end_line != '\n') {
                 end_line++;
+                size--; // Decrease size for every step to avoid exceeding buffer size
+            }
+
+            // Ensure that end of line was found
+            if (size == 0) {
+                return; // Not parseable as the line isn't complete
             }
 
             uint64_t result = 0;
             for (const uint8_t *i = addr; i < end_line; ++i) {
+                if (*i < '0' || *i > '9') {
+                    return; // Not parseable as a non-digit character was found
+                }
                 result = (result * 10) + (*i - '0');
             }
-            size -= end_line - addr;
+
             addr = end_line + 1;
-            size -= 2;
+            size -= 2; // Adjusting for the skipped initial "* " and the newline
+            if (size <= 0) {
+                return; // Not enough data left
+            }
+
             tsp->debug(u"loaded splicemonitor pts: %d", {result});
 
             std::ostringstream os;
 
-            for (size_t i = 0; i < size; i += 3) {
+            for (size_t i = 0; i + 1 < size; i += 3) {
                 unsigned int byteValue;
                 std::stringstream ss;
                 ss << std::hex << addr[i] << addr[i + 1];
