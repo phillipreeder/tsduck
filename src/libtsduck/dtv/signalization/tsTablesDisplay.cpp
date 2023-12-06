@@ -101,8 +101,7 @@ void ts::TablesDisplay::defineArgs(Args& args)
 
 bool ts::TablesDisplay::loadArgs(DuckContext& duck, Args &args)
 {
-    _raw_dump = args.present(u"raw-dump");
-    _raw_flags = UString::HEXA;
+    setRawMode(args.present(u"raw-dump"));
     if (args.present(u"c-style")) {
         _raw_dump = true;
         _raw_flags |= UString::C_STYLE;
@@ -402,6 +401,17 @@ void ts::TablesDisplay::logLine(const UString& line)
         // Use the report object for logging.
         _duck.report().info(line);
     }
+}
+
+
+//----------------------------------------------------------------------------
+// Forces the display to set raw dump mode
+//----------------------------------------------------------------------------
+
+void ts::TablesDisplay::setRawMode(const bool enable)
+{
+    _raw_dump = enable;
+    _raw_flags = UString::HEXA;
 }
 
 

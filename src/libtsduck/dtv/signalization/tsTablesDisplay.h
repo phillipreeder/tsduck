@@ -125,6 +125,12 @@ namespace ts {
         virtual void logLine(const UString& line);
 
         //!
+        //! Force the display to enter raw mode
+        //! @param [in] enable Whether to enable raw mode.
+        //!
+        virtual void setRawMode(const bool enable);
+
+        //!
         //! Display a table on the output stream.
         //! The content of the table is interpreted according to the table id.
         //! @param [in] table The table to display.

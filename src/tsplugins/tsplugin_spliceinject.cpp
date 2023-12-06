@@ -118,6 +118,8 @@ namespace ts {
         int64_t       _max_file_size;
         size_t        _queue_size;
         SectionPtr    _null_splice;       // A null splice section to maintain PID bitrate.
+        
+        virtual void parseSection(std::istringstream& strm, FType type, uint64_t pts);
 
         // The plugin contains two internal threads in addition to the packet processing thread.
         // One thread polls input files and another thread receives UDP messages.
@@ -130,10 +132,11 @@ namespace ts {
         {
             TS_NOBUILD_NOCOPY(SpliceCommand);
         public:
-            SpliceCommand(SpliceInjectPlugin* plugin, const SectionPtr& sec);
+            SpliceCommand(SpliceInjectPlugin* plugin, const SectionPtr& sec, uint64_t known_pts);
 
             SpliceInformationTable sit;       // The analyzed Splice Information Table.
             SectionPtr             section;   // The binary SIT section.
+            uint64_t               force_pts;  // Next PTS after which the section shall be inserted (INVALID_PTS means immediate).
             uint64_t               next_pts;  // Next PTS after which the section shall be inserted (INVALID_PTS means immediate).
             uint64_t               last_pts;  // PTS after which the section shall no longer be inserted (INVALID_PTS means never).
             uint64_t               interval;  // Interval between two insertions in PTS units.
@@ -695,10 +698,25 @@ void ts::SpliceInjectPlugin::provideSection(SectionCounter counter, SectionPtr& 
             break;
         }
         assert(cmd->sit.isValid());
+        
+        if (cmd->force_pts != INVALID_PTS) {
+            // once we're after the force_pts time
+            if (SequencedPTS(cmd->force_pts, _last_pts)) {
+                CommandPtr cmd2;
+                const bool dequeued = _queue.dequeue(cmd2, 0);
+                assert(dequeued);
+                assert(cmd2 == cmd);
+
+                // Now we have a section to send.
+                section = cmd->section;
+                tsp->verbose(u"injecting %s, current PTS: %d", {*cmd, _last_pts});
+            }
+            break;
+        }
 
         // If the command has a termination PTS and this PTS is in the past,
         // drop the command and loop on next command from the queue.
-        if (cmd->last_pts != INVALID_PTS && SequencedPTS(cmd->last_pts, _last_pts)) {
+        else if (cmd->last_pts != INVALID_PTS && SequencedPTS(cmd->last_pts, _last_pts)) {
             CommandPtr cmd2;
             const bool dequeued = _queue.dequeue(cmd2, 0);
             assert(dequeued);
@@ -764,6 +782,51 @@ bool ts::SpliceInjectPlugin::doStuffing()
 }
 
 
+void ts::SpliceInjectPlugin::parseSection(std::istringstream& strm, FType type, uint64_t pts) {
+    tsp->debug(u"parsing section:\n%s",
+               {UString::Dump(strm.str().c_str(), strm.str().length(), UString::HEXA | UString::ASCII, 4)});
+
+    // Analyze the message as a binary, XML or JSON section file.
+    SectionFile secFile(duck);
+    if (!secFile.load(strm, type)) {
+        // Error loading sections, error message already reported.
+        return;
+    }
+
+    // Loop on all sections in the file or message.
+    // Each section is expected to be a splice information section.
+    for (auto it = secFile.sections().begin(); it != secFile.sections().end(); ++it) {
+        SectionPtr sec(*it);
+        if (!sec.isNull()) {
+            if (sec->tableId() != TID_SCTE35_SIT) {
+                tsp->error(u"unexpected section, %s, ignored",
+                           {names::TID(duck, sec->tableId(), CASID_NULL, NamesFlags::VALUE)});
+            } else {
+                CommandPtr cmd(new SpliceCommand(this, sec, pts));
+                if (cmd.isNull() || !cmd->sit.isValid()) {
+                    tsp->error(u"received invalid splice information "
+                               u"section, ignored");
+                } else {
+                    tsp->verbose(u"enqueuing %s", {*cmd});
+                    if (!_queue.enqueue(cmd, 0)) {
+                        tsp->warning(u"queue overflow, dropped one section");
+                    }
+                }
+            }
+        }
+    }
+
+    // If --wait-first-batch was specified, signal when the first batch
+    // of commands is queued.
+    if (_wait_first_batch && !_wfb_received) {
+        GuardCondition lock(_wfb_mutex, _wfb_condition);
+        _wfb_received = true;
+        lock.signal();
+    }
+    return;
+}
+
+
 //----------------------------------------------------------------------------
 // Process a section message. Invoked from listener threads.
 //----------------------------------------------------------------------------
@@ -778,8 +841,64 @@ void ts::SpliceInjectPlugin::processSectionMessage(const uint8_t* addr, size_t s
         if (addr[0] == TID_SCTE35_SIT) {
             // First byte is the table id of a splice information table.
             type = FType::BINARY;
-        }
-        else if (addr[0] == '<') {
+        } else if (addr[0] == '*') {
+            // Start of splicemonitor
+            type = FType::BINARY;
+
+            // Boundary check
+            if (size < 2) {
+                return; // Buffer is too small to even skip initial "* "
+            }
+            addr += 2; // Skip initial "* "
+            size -= 2;
+
+            const uint8_t *end_line = addr;
+            while (size > 0 && *end_line != '\n') {
+                end_line++;
+                size--; // Decrease size for every step to avoid exceeding buffer size
+            }
+
+            // Ensure that end of line was found
+            if (size == 0) {
+                return; // Not parseable as the line isn't complete
+            }
+
+            uint64_t result = 0;
+            for (const uint8_t *i = addr; i < end_line; ++i) {
+                if (*i < '0' || *i > '9') {
+                    return; // Not parseable as a non-digit character was found
+                }
+                result = (result * 10) + (*i - '0');
+            }
+
+            addr = end_line + 1;
+            size -= 2; // Adjusting for the skipped initial "* " and the newline
+            if (size <= 0) {
+                return; // Not enough data left
+            }
+
+            tsp->debug(u"loaded splicemonitor pts: %d", {result});
+
+            std::ostringstream os;
+
+            for (size_t i = 0; i + 1 < size; i += 3) {
+                unsigned int byteValue;
+                std::stringstream ss;
+                ss << std::hex << addr[i] << addr[i + 1];
+                ss >> byteValue;
+
+                if (byteValue > 0xFF) {
+                    throw std::runtime_error("Invalid byte value");
+                }
+
+                uint8_t byte = static_cast<uint8_t>(byteValue);
+                os.write(reinterpret_cast<char *>(&byte), sizeof(byte));
+            }
+
+            std::istringstream strm = std::istringstream(os.str(), std::ios::binary);
+            return parseSection(strm, FType::BINARY, result);
+
+        } else if (addr[0] == '<') {
             // Typically the start of an XML definition.
             type = FType::XML;
         }
@@ -818,44 +937,7 @@ void ts::SpliceInjectPlugin::processSectionMessage(const uint8_t* addr, size_t s
 
     // Consider the memory as a C++ input stream.
     std::istringstream strm(std::string(reinterpret_cast<const char*>(addr), size));
-    tsp->debug(u"parsing section:\n%s", {UString::Dump(addr, size, UString::HEXA | UString::ASCII, 4)});
-
-    // Analyze the message as a binary, XML or JSON section file.
-    SectionFile secFile(duck);
-    if (!secFile.load(strm, type)) {
-        // Error loading sections, error message already reported.
-        return;
-    }
-
-    // Loop on all sections in the file or message.
-    // Each section is expected to be a splice information section.
-    for (auto it = secFile.sections().begin(); it != secFile.sections().end(); ++it) {
-        SectionPtr sec(*it);
-        if (!sec.isNull()) {
-            if (sec->tableId() != TID_SCTE35_SIT) {
-                tsp->error(u"unexpected section, %s, ignored", {names::TID(duck, sec->tableId(), CASID_NULL, NamesFlags::VALUE)});
-            }
-            else {
-                CommandPtr cmd(new SpliceCommand(this, sec));
-                if (cmd.isNull() || !cmd->sit.isValid()) {
-                    tsp->error(u"received invalid splice information section, ignored");
-                }
-                else {
-                    tsp->verbose(u"enqueuing %s", {*cmd});
-                    if (!_queue.enqueue(cmd, 0)) {
-                        tsp->warning(u"queue overflow, dropped one section");
-                    }
-                }
-            }
-        }
-    }
-
-    // If --wait-first-batch was specified, signal when the first batch of commands is queued.
-    if (_wait_first_batch && !_wfb_received) {
-        GuardCondition lock(_wfb_mutex, _wfb_condition);
-        _wfb_received = true;
-        lock.signal();
-    }
+    parseSection(strm, type, _last_pts);
 }
 
 
@@ -863,9 +945,10 @@ void ts::SpliceInjectPlugin::processSectionMessage(const uint8_t* addr, size_t s
 // Splice command object constructor
 //----------------------------------------------------------------------------
 
-ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin* plugin, const SectionPtr& sec) :
+ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin *plugin, const SectionPtr &sec, const uint64_t known_pts) :
     sit(),
     section(sec),
+    force_pts(known_pts),
     next_pts(INVALID_PTS),   // inject immediately
     last_pts(INVALID_PTS),   // no injection time limit
     interval((plugin->_inject_interval * SYSTEM_CLOCK_SUBFREQ) / MilliSecPerSec), // in PTS units
@@ -884,12 +967,12 @@ ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin* plugin,
         sit.deserialize(_plugin->duck, table);
     }
 
-    // The initial values for the member fields are set for one immediate injection.
-    // This must be changed for non-immediate splice_insert() and time_signal() commands.
+    // The initial values for the member fields are set for one immediate
+    // injection. This must be changed for non-immediate splice_insert() and
+    // time_signal() commands.
     if (sit.isValid() &&
         ((sit.splice_command_type == SPLICE_TIME_SIGNAL && sit.time_signal.set()) ||
-         (sit.splice_command_type == SPLICE_INSERT && !sit.splice_insert.canceled && !sit.splice_insert.immediate)))
-    {
+        (sit.splice_command_type == SPLICE_INSERT && !sit.splice_insert.canceled && !sit.splice_insert.immediate))) {
         // Compute the splice event PTS value. This will be the last time for
         // the splice command injection since the event is obsolete afterward.
         if (sit.splice_command_type == SPLICE_INSERT) {
@@ -936,19 +1019,28 @@ ts::SpliceInjectPlugin::SpliceCommand::SpliceCommand(SpliceInjectPlugin* plugin,
 
 bool ts::SpliceInjectPlugin::SpliceCommand::operator<(const SpliceCommand& other) const
 {
-    if (next_pts == other.next_pts) {
+    uint64_t my_next_pts = next_pts;
+    uint64_t other_next_pts = other.next_pts;
+    if (force_pts != INVALID_PTS) {
+        my_next_pts = force_pts;
+    }
+    if (other.force_pts != INVALID_PTS) {
+        other_next_pts = other.force_pts;
+    }
+    
+    if (my_next_pts == other_next_pts) {
         // Either both elements are immediate or non-immediate with same starting point.
         // We always consider this object greater than other so that messages with equal
         // starting points are queued in order of appearance.
         return false;
     }
-    else if (next_pts == INVALID_PTS) {
+    else if (my_next_pts == INVALID_PTS) {
         // This object is immediate, other is not.
         return true;
     }
     else {
         // This object is not immediate.
-        return other.next_pts != INVALID_PTS && next_pts < other.next_pts;
+        return other_next_pts != INVALID_PTS && my_next_pts < other_next_pts;
     }
 }
 
@@ -978,7 +1070,10 @@ ts::UString ts::SpliceInjectPlugin::SpliceCommand::toString() const
         {
             name.append(UString::Format(u" @0x%09X", {sit.splice_insert.program_pts.value()}));
         }
-        if (next_pts == INVALID_PTS) {
+        if (force_pts != INVALID_PTS) {
+            name.append(UString::Format(u", force %d", {force_pts}));
+        }
+        else if (next_pts == INVALID_PTS) {
             name.append(u", immediate");
         }
         else {
